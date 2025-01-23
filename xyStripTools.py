@@ -9,6 +9,13 @@ from scipy import stats
 from scipy.optimize import curve_fit
 from scipy.stats import crystalball
 import json
+from matplotlib import cm
+
+
+
+
+# dataframe with time offset info used for 3D reconstruction
+T_off = pd.read_pickle("./data/time_offset.pk")
 
 
 # Colorblind friendly color color palette
@@ -115,177 +122,166 @@ read_clusters = lambda  files: pd.concat( [read_cluster(file) for file in files]
 read_hits = lambda  files: pd.concat( [read_hit(file) for file in files] ,ignore_index=True)
 
 
-# Gaussian Function
-def gaus(x, y_off, const, mu, sigma):
-    return y_off + const* np.exp(-0.5*((x - mu)/sigma)**2)
+# adds diffusion to a track
+# The paramters, in order, are:
+# tracks, a dataframe with the raw track info
+# Transverse diffusion coefficent for 70% He 30% CO2 from Magboltz [cm/sqrt(cm)]
+# Longitudinal diffusion coefficent for 70% He 30% CO2 from Magboltz [cm/sqrt(cm)]
 
-# Gaussian Function with no offset
-def gaus2(x, const, mu, sigma):
-    return const* np.exp(-0.5*((x - mu)/sigma)**2)
+def add_diff(tracks, DTrans = 0.0135, DLong = 0.0129):
 
+    tracks["diff_track"] = tracks.apply(lambda row: row.track + np.array([DTrans*np.sqrt(np.abs(row.track.T[2]))*np.random.normal(size=len(row.track)),DTrans*np.sqrt(np.abs(row.track.T[2]))*np.random.normal(size=len(row.track)),DLong*np.sqrt(np.abs(row.track.T[2]))*np.random.normal(size=len(row.track))]).T ,axis=1)
+    return tracks
+
+# Simulate x/y strip readout
+# the parameters, in order, are:
+# peaking time [ns]
+# digitization time [ns] 
+# pitch of the x strips [um]
+# pitch of the y strips [um]
+# Threshold of x strips [No. electrons]
+# Threshold of y strips [No. electrons]
+# Charge sharing [lower strips / upper strips]
+# Gain - extrapolating from PHA curve
+# drift speed cm/ns
+# Include charge integration effect.
+# z resolution in cm, must be specified if Charge_integration = False
+# Electronic gain in x [mV/fC]
+# Electronic gain in y [mV/fC]
+def sim_readout(tracks, peaking_time = 200, digit_t  = 250, pitch_x = 200, pitch_y = 200,thres_x = 82/9.0*6241.5, thres_y =  82/4.5*6241.5, CS = 0.62, Gain = 60000, v_drift = 0.0008, Charge_integration = True, DL = 1.2, pitch_z = 0.02, G_x = 9.0, G_y = 4.5):
+
+    #convert pitch to cm
+    pitch_x = pitch_x * 1e-4
+    pitch_y = pitch_y * 1e-4
     
-# Horizontal fit Function
-def horizontal(x, H):
-    return H
+    # Readout is 10 cm x 10 cm
+    x_bins = np.arange(-5,5,pitch_x)
+    y_bins = np.arange(-5,5,pitch_y)
+
+    # Find strip edges in x and y
+    Left_edges_x = x_bins[0:-1]
+    Right_edges_x = x_bins[1:]
+    Left_edges_y = y_bins[0:-1]
+    Right_edges_y = y_bins[1:]
 
 
-# Exponential plateau fit function
-def exp_plat(x, a, b, c):
-	return a * (1.0 - np.e**(-b * (x - c)))
+    hits = pd.DataFrame(columns = ['strips_x', 'strips_y', 'times_x', 'times_y','electrons_x','electrons_y'])
 
+    for index, row in tracks.iterrows():
 
-# exponential decay fit function
-def invs(x, a, b):
-	return np.sqrt((a/x)**2+(b)**2)
+        track = row.diff_track
+        #Keep only point above the xy-plane (points below it do not get amplified)
+        track = track[track[:,2]>0]
 
-# linear fit function
-def linear(x, a, b):
-	return (a * x) + b
+        x_positions = []
+        x_charges = []
+        x_times = []
+        adcs0 = []
+        strips0 = []
 
+        for L_edge,R_edge in zip(Left_edges_x,Right_edges_x):
 
-    
-# Creates an object which manages all config and calib informatuion
-class VMMconfig:
-    
-    def __init__(self, strip_map_loc = None, pedestal_loc = None, THL_DAC_loc = None, PLSR_DAC_loc = None, THL_loc = None):
-        
-        # Store file locations
-        self.strip_map_loc = strip_map_loc  # Location of the strip to channel mapping file
-        self.pedestal_loc = pedestal_loc  # Location of the pedestal scan output file
-        self.THL_DAC_loc = THL_DAC_loc # Location of the global threshold DAC calibration output file
-        self.PLSR_DAC_loc = PLSR_DAC_loc # Location of the global Pulser DAC calibration output file
-        self.THL_loc = THL_loc # Location of the measured threshold output file
-        
-        if self.strip_map_loc == None:
-            raise Exception("You must provide a strip to channel mapping")
-            
-        #store strip mapping info into dataframe
-        self.StripInfo = pd.DataFrame(columns = ['det', 'plane', 'fec', 'vmm','ch','pos'])
-        mapping = json.load(open(self.strip_map_loc))
-        
-        # Add mapping info to the data frame
-        for vmm in mapping["vmm_geometry"]:
-            for ch, pos in enumerate(vmm['id0']):
-                self.StripInfo = self.StripInfo.append({'det' : vmm['detector'], 'plane' : vmm['plane'], 'fec' : vmm['fec'], 'vmm' : vmm['vmm'], 'ch' :  ch, 'pos' : pos }, ignore_index = True)
-        
-        # Add pedestal info if it is available
-        if self.pedestal_loc != None:
-            # Read pedestal info [mV]
-            df_ped = pd.read_csv(self.pedestal_loc,usecols = [' fec', 'vmm', 'ch', ' pedestal [mV]']).rename(columns={" fec": "fec", " pedestal [mV]": "pedestal"})
-            # Remove rows with header info, switch data type to int
-            df_ped = df_ped.loc[df_ped.fec != ' fec'].astype('int32')
-            # Convert the VMM slow control fecID to fecID set in firmware based on IP address
-            df_ped["fec"] = df_ped["fec"].apply(self.fecIDmap)
-            # Add pedestal info to df
-            self.StripInfo = self.StripInfo.merge(df_ped, on=['vmm', 'ch', 'fec'], how='left')
-            # Create an offline mask keeping only channels with 140mV < pedestal < 200mV
-            # These channels are  damaged and do not fire
-            self.StripInfo["mask"] = self.StripInfo["pedestal"].apply(lambda x: (140<x) and (x<200) )
-            
-        # Add threshold info if it is available
-        if self.THL_loc != None:
-            # Read threshold info [mV]
-            df_thres = pd.read_csv(self.THL_loc, usecols = [' fec', 'vmm', 'ch', ' threshold [mV]']).rename(columns={" fec": "fec", " threshold [mV]": "threshold"})
-            # Remove rows with header info, switch data type to int
-            df_thres = df_thres.loc[df_thres.fec != ' fec'].astype('int32')
-            # Convert the VMM slow control fecID to fecID set in firmware based on IP address
-            df_thres["fec"] = df_thres["fec"].apply(self.fecIDmap)
-            # Add threshold info to df
-            self.StripInfo = self.StripInfo.merge(df_thres, on=['vmm', 'ch', 'fec'], how='left')
-        
-        # Store threshold DAC info if it is given
-        if self.THL_DAC_loc != None:
-            # read specified columns of the Threshold DAC csv and rename the columns
-            self.THL_DAC = pd.read_csv(self.THL_DAC_loc, usecols= [' fec', 'vmm', ' threshold dac setting',' threshold dac measured']).rename(columns={" fec": "fec", " threshold dac setting": "THL_DAC", " threshold dac measured": "THL_mV"})
-            # Remove rows with header info, switch data type to int
-            self.THL_DAC = self.THL_DAC.loc[(self.THL_DAC.fec != ' fec') ].astype('int32')
-            # Remove rows with DAC < 200 as we do not fit those (See Lucian's thesis section 3.1) 
-            self.THL_DAC = self.THL_DAC.loc[(self.THL_DAC.THL_DAC >= 200) ]
-            # Convert the VMM slow control fecID to fecID set in firmware based on IP address
-            self.THL_DAC["fec"] = self.THL_DAC["fec"].apply(self.fecIDmap)
+            # Bin track over specific strip in x
+            T_track = track[(track[:,0]> L_edge) &  (track[:,0]< R_edge)] 
 
-            # Collect DAC and corresponding mV values for each fec/VMM combination as an array
-            THL_DACs = self.THL_DAC.groupby(['fec', 'vmm'])['THL_DAC'].apply(np.array).reset_index()
-            THL_mVs = self.THL_DAC.groupby(['fec', 'vmm'])['THL_mV'].apply(np.array).reset_index()
+            # If there is charge above this strip
+            if len(T_track > 0):
 
-            # Merge it togather
-            self.THL_DAC = THL_DACs.merge(THL_mVs, on=['vmm', 'fec'], how='left')
+                # Get time distribution of charge over this strip
+                time_dist = T_track[:,2]/v_drift
 
-            # Compute the slope and offset
-            self.THL_DAC["slope"] = self.THL_DAC.apply(lambda row: np.polyfit(row.THL_DAC, row.THL_mV, 1)[0] ,axis=1)
-            self.THL_DAC["offset"] = self.THL_DAC.apply(lambda row: np.polyfit(row.THL_DAC, row.THL_mV, 1)[1] ,axis=1)
+                # Create all hits for this strip taking into account the peaking time and the digitization time 
+                while len(time_dist) > 0:
 
-        # Store threshold DAC info if it is given
-        if self.PLSR_DAC_loc != None:         
-            # read specified columns of the Pulser DAC csv and rename the columns
-            self.PLSR_DAC = pd.read_csv(self.PLSR_DAC_loc, usecols= [' fec', 'vmm', ' pulser dac setting',' pulser dac measured']).rename(columns={" fec": "fec", " pulser dac setting": "PLSR_DAC", " pulser dac measured": "PLSR_mV"})
-            # Remove rows with header info, switch data type to int
-            self.PLSR_DAC = self.PLSR_DAC.loc[(self.PLSR_DAC.fec != ' fec') ].astype('int32')
-            # Remove rows with DAC < 200 as we do not fit those (See Lucian's thesis section 3.1) 
-            self.PLSR_DAC = self.PLSR_DAC.loc[(self.PLSR_DAC.PLSR_DAC >= 200) ]
-            # Convert the VMM slow control fecID to fecID set in firmware based on IP addres
-            self.PLSR_DAC["fec"] = self.PLSR_DAC["fec"].apply(self.fecIDmap)
+                    # Shift so that min is t = 0ns
+                    min_time = np.min(time_dist)
+                    time_dist= time_dist-min_time
 
-            # Collect DAC and corresponding mV values for each fec/VMM combination as an array
-            PLSR_DACs = self.PLSR_DAC.groupby(['fec', 'vmm'])['PLSR_DAC'].apply(np.array).reset_index()
-            PLSR_mVs = self.PLSR_DAC.groupby(['fec', 'vmm'])['PLSR_mV'].apply(np.array).reset_index()
+                    # This hit will only contain charge arriving within the peaking time
+                    time_dist_hit = time_dist [time_dist < peaking_time]
 
-            # Merge it togather
-            self.PLSR_DAC = PLSR_DACs.merge(PLSR_mVs, on=['vmm', 'fec'], how='left')
+                    # compute mean time for this hit
+                    mean_time = np.mean(time_dist_hit)+min_time
 
-            # Compute the slope and offset
-            self.PLSR_DAC["slope"] = self.PLSR_DAC.apply(lambda row: np.polyfit(row.PLSR_DAC, row.PLSR_mV, 1)[0] ,axis=1)
-            self.PLSR_DAC["offset"] = self.PLSR_DAC.apply(lambda row: np.polyfit(row.PLSR_DAC, row.PLSR_mV, 1)[1] ,axis=1)
+                    # obtain detected charge for this hit taking into account primary ionization, gain, and charge sharing
+                    # This is a simple prelminary tratement for the gain that should be improved in the future 
+                    charge_detected = len(time_dist_hit) *Gain * CS / (CS+1.0)
+
+                    # only store infor for the hit if the charge detected exceeds the threshold
+                    if charge_detected > thres_x:
+                            
+                        # obtain mean time for the hit
+                        x_times += [mean_time]
+                        # obtain position of the hit
+                        x_positions += [ (L_edge+R_edge)/2.0 ]
+                        # Position expressed consistently with exp digitized data
+                        strips0 += [np.where(x_bins == L_edge)[0][0]]
+                        # obtain detected charge taking into account primary ionization, gain, and charge sharing
+                        x_charges += [ charge_detected ]
+                        # Charge expressed consistently with exp digitized data
+                        adcs0 += [min( charge_detected/6241.5*G_x, 1023.0 ) ]
+
+                    # The time distribution is updated to take into account the digitization time
+                    time_dist = time_dist[ time_dist > (peaking_time+digit_t) ] + min_time
 
         
-    # This method converts the VMMslowcontrol fecID to the fecID set in firmware (based on IP address)
-    # This must be set manually, currently there is only 1 fec and it's IP is 2
-    def fecIDmap(self,x):
-        if x == 1:
-            return 2
-        else:
-            raise Exception("Invalid fecID. Update the fecIDmap method")
-            
-    # suggests threshold DAC values such that there is equal distance in mV between pedestal and threshold for each VMM
-    # target_from_pedestal is the desired distance from pedestal
-    def THL_DAC_settings(self, target_from_pedestal):
 
-        if self.THL_DAC_loc == None:
-            raise Exception("A threshold DAC calibration must be provided")
-            
-        if self.pedestal_loc == None:
-            raise Exception("A pedestal scan must be provided")
+        y_positions = []
+        y_charges = []
+        y_times = []
+        adcs1 = []
+        strips1 = []
 
-        # Collect pedestal info for each channel
-        test_ped = self.StripInfo[["fec","vmm","pedestal","mask"]].copy()
-        # Remove damaged and masked channels (channels where pedestal is too high or low)
-        test_ped = test_ped.loc[ test_ped["mask"] ].reset_index(drop=True)
-        # Get the mean pedestal value per VMM
-        test_ped = test_ped.groupby(["fec","vmm"]).mean().reset_index()
+        for L_edge,R_edge in zip(Left_edges_y,Right_edges_y):
 
-        # Collect DAC calibration info VMM
-        test_THL = self.THL_DAC.copy()
-        # Add the mean pedestal value per VMM to this data frame
-        test_THL = test_THL.merge(test_ped, on=['fec','vmm'], how='left')
+            # Bin track over specific strip in x
+            T_track = track[(track[:,1]> L_edge) &  (track[:,1]< R_edge)]
 
-        # Compute the target threshold as the pedestal + the provided target from pedestal
-        test_THL["target_thres_mV"] = test_THL["pedestal"] + target_from_pedestal
-        # Use the DAC calibrations to get suggested DAC value for each VMM
-        test_THL["threshold_DAC"] = ( test_THL["target_thres_mV"] - self.THL_DAC["offset"])/self.THL_DAC["slope"]
+            # If there is charge above this strip
+            if len(T_track > 0):
+
+                # Get time distribution of charge over this strip
+                time_dist = T_track[:,2]/v_drift
+
+                # Create all hits for this strip taking into account the peaking time and the digitization time 
+                while len(time_dist) > 0:
+
+                    # Shift so that min is t = 0ns
+                    min_time = np.min(time_dist)
+                    time_dist= time_dist-min_time
+
+                    # This hit will only contain charge arriving within the peaking time
+                    time_dist_hit = time_dist [time_dist < peaking_time]
+
+                    # compute mean time for this hit
+                    mean_time = np.mean(time_dist_hit)+min_time
+
+                    # obtain detected charge for this hit taking into account primary ionization, gain, and charge sharing
+                    # This is a simple prelminary tratement for the gain that should be improved in the future 
+                    charge_detected = len(time_dist_hit) * Gain / (CS+1.0)
+
+                    if charge_detected > thres_y:
+
+                        # obtain mean time for the hit
+                        y_times += [mean_time]
+                        # obtain position of the hit
+                        y_positions += [ (L_edge+R_edge)/2.0 ]
+                        # Position expressed consistently with exp digitized data
+                        strips1 += [np.where(y_bins == L_edge)[0][0]]
+                        # obtain detected charge taking into account primary ionization, gain, and charge sharing
+                        y_charges += [ charge_detected ]
+                        # Charge expressed consistently with exp digitized data
+                        adcs1 += [ min( charge_detected/6241.5*G_y, 1023.0 ) ] # The min imposes saturation of ADC scale
+
+                    # The time distribution is updated to take into account the digitization time
+                    time_dist = time_dist[ time_dist > (peaking_time+digit_t) ] + min_time
+
+
+
+        hits = hits.append({'strips_x' : np.array(x_positions), 'strips0' : np.array(strips0),  'strips_y' : np.array(y_positions), 'strips1' : np.array(strips1), 'times_x' : np.array(x_times), 'times0' : np.array(x_times), 'times_y' : np.array(y_times), 'times1' : np.array(y_times), 'electrons_x' :  np.array(x_charges), 'adcs0' :  np.array(adcs0), 'electrons_y' : np.array(y_charges), 'adcs1' :  np.array(adcs1) }, ignore_index = True)
         
-        return test_THL[["fec","vmm","pedestal","target_thres_mV","threshold_DAC"]]
-    
-    
-    # suggests threshold DAC values given a target in mV
-    def PLSR_DAC_settings(self, target):
+    return hits
 
-        if self.PLSR_DAC_loc == None:
-            raise Exception("A Pulser DAC calibration must be provided")
-            
-        df_suggested_DAC = self.PLSR_DAC[["fec","vmm"]].copy()
-        df_suggested_DAC["PLSR_DAC"] = (target - self.PLSR_DAC["offset"])/self.PLSR_DAC["slope"]
-        
-        return df_suggested_DAC
 
 
 # Track-level class for reconstructing and visualizing
@@ -1308,6 +1304,7 @@ def random_three_vector(theta_min,theta_max):
     z = -1 * np.cos( theta ) # times -1 to flip it to the -z direction
 
     return np.array([x,y,z])
+    
 
 
 # Plot a point cloud of the track
@@ -1321,12 +1318,54 @@ def plot_track(track):
     fig = plt.figure()
     ax = plt.axes(projection='3d')
 
-    ax.scatter3D(x_points, y_points, z_points, c='k', marker='o', alpha=0.1)
+    ax.scatter3D(x_points, y_points, z_points, c='k', marker='o',s=1, alpha=0.1)
 
     ax.set_xlabel('x [cm]',fontsize=15)
     ax.set_ylabel('y [cm]',fontsize=15)
     ax.set_zlabel('z [cm]',fontsize=15)
     ax.tick_params(labelsize=12)
+    set_axes_equal(ax)
+    plt.tight_layout()
+
+def make_voxel_plot(x,y,z,c):
+
+
+
+    x = np.round((x-np.min(x))/200).astype(int)
+    y = np.round((y-np.min(y))/200).astype(int)
+    z = np.round((z-np.min(z))/200).astype(int)
+
+    # Empty array to store tensor
+    tensor = np.zeros(shape=(np.max(x)+1,np.max(y)+1,np.max(z)+1))
+
+    # Loop through track and update tensor
+    for xj, yj, zj, cj in zip(x,y,z,c):
+
+        tensor[xj][yj][zj] = cj
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = plt.axes(projection='3d')
+
+    ax.set_xlabel('x strip',labelpad = 40,fontsize=25)
+    ax.set_ylabel('y strip',labelpad = 40,fontsize=25)
+    ax.set_zlabel('z bin',labelpad = 40,fontsize=25)
+    ax.tick_params(labelsize=20)
+    ax.tick_params(direction='out', pad=20)
+    ax.set_box_aspect(None, zoom=0.85)
+
+
+    cmap = plt.get_cmap("viridis")
+    norm= plt.Normalize(0.0, 400000)
+
+
+    ax.voxels(tensor,facecolors=cmap(norm(tensor)),alpha=1)
+
+    m = cm.ScalarMappable(cmap=cmap, norm=norm)
+    m.set_array([])
+    cbar = plt.colorbar(m,fraction=0.03, pad=0.07)
+    cbar.set_label(label='No. electrons',size=25)
+    cbar.ax.tick_params(labelsize=20)
+
     set_axes_equal(ax)
     plt.tight_layout()
     
