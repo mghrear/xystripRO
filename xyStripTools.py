@@ -10,6 +10,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import crystalball
 import json
 from matplotlib import cm
+from ROOT import TFile, TVector3, TMath
 
 
 
@@ -1304,8 +1305,34 @@ def random_three_vector(theta_min,theta_max):
     z = -1 * np.cos( theta ) # times -1 to flip it to the -z direction
 
     return np.array([x,y,z])
-    
 
+# Draw a 3-D vector from an isotropic distribution
+def random_three_vector2():
+
+    """
+
+    Generates a random 3D unit vector (direction) with a uniform spherical distribution
+
+    Algo from http://stackoverflow.com/questions/5408276/python-uniform-spherical-distribution
+
+    :return:
+
+    """
+
+    phi = np.random.uniform()*2*np.pi
+
+    costheta = 2.0*np.random.uniform()-1.0
+
+
+    theta = TMath.ACos( costheta )
+
+    x = TMath.Sin( theta) * TMath.Cos( phi )
+
+    y = TMath.Sin( theta) * TMath.Sin( phi )
+
+    z = TMath.Cos( theta )
+
+    return TVector3(x,y,z)
 
 # Plot a point cloud of the track
 def plot_track(track):
